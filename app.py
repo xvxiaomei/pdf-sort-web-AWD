@@ -4,6 +4,8 @@ from PyPDF2 import PdfReader, PdfWriter
 import pdfplumber
 import re
 import tempfile
+from PIL import Image, ImageDraw
+import io
 
 # ================= 页面设置 =================
 st.set_page_config(page_title="PDF 排序工具", page_icon="📄", layout="wide")
@@ -34,12 +36,11 @@ def extract_barcode(page, pdf_type):
         match = re.search(r'\d{18}', text)
         return match.group() if match else ""
     else:  # FBA
-        # FBA 纸张 100×100mm -> pt (1mm ≈ 2.83465 pt)
-        # 示例条码区域坐标，可根据实际 PDF 调整
-        x0, y0 = 50, 260   # 左下角偏移
-        crop_width, crop_height = 150, 24
-        x1 = x0 + crop_width
-        y1 = y0 + crop_height
+        # FBA 条码实际位置
+        x0, y0 = 325, 846
+        w, h = 385, 24
+        x1 = x0 + w
+        y1 = y0 + h
 
         # 限制坐标在页面范围内
         x0 = max(0, x0)
@@ -52,7 +53,45 @@ def extract_barcode(page, pdf_type):
             text = crop.extract_text() or ""
         except ValueError:
             text = ""
-        return text.strip()
+
+        # 清理文本：去空格、换行，统一大写
+        text = re.sub(r'\s+', '', text).upper()
+        return text
+
+# ================= FBA 可视化函数 =================
+def visualize_fba_barcode(pdf_path):
+    with pdfplumber.open(pdf_path) as pdf:
+        images = []
+        for i, page in enumerate(pdf.pages):
+            pil_image = page.to_image(resolution=150).original
+            draw = ImageDraw.Draw(pil_image)
+            # 条码位置
+            x0, y0 = 325, 846
+            w, h = 385, 24
+            x1 = x0 + w
+            y1 = y0 + h
+            # pdfplumber y 原点在底部，Pillow y 原点在顶部，需要转换
+            pil_h = pil_image.height
+            y0_pil = pil_h - y1
+            y1_pil = pil_h - y0
+            draw.rectangle([x0, y0_pil, x1, y1_pil], outline="red", width=3)
+            # 保存到内存
+            buf = io.BytesIO()
+            pil_image.save(buf, format="PNG")
+            buf.seek(0)
+            images.append((i+1, buf))
+    return images
+
+# ================= 可视化显示 FBA 条码区域 =================
+if pdf_type == "FBA" and uploaded_pdf:
+    st.subheader("🔍 FBA 条码提取区域可视化")
+    tmp_pdf_path_vis = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf").name
+    with open(tmp_pdf_path_vis, "wb") as f:
+        f.write(uploaded_pdf.read())
+    images = visualize_fba_barcode(tmp_pdf_path_vis)
+    for page_num, img_buf in images:
+        st.write(f"Page {page_num}")
+        st.image(img_buf, use_column_width=True)
 
 # ================= 处理逻辑 =================
 if uploaded_excel and uploaded_pdf:
@@ -61,17 +100,18 @@ if uploaded_excel and uploaded_pdf:
 
         # 读取 Excel
         df = pd.read_excel(uploaded_excel)
-        # 修正列名空格和大小写
         df.columns = df.columns.str.strip().str.lower()
         if 'label_bar_code' not in df.columns or 'carton_code' not in df.columns:
             st.error("Excel 必须包含列：label_bar_code 和 carton_code")
             st.stop()
 
-        mapping = dict(zip(df['label_bar_code'].astype(str), df['carton_code']))
+        # 建立映射并清理条码
+        mapping = {str(k).strip().upper(): str(v).strip() for k, v in zip(df['label_bar_code'], df['carton_code'])}
 
         # 临时保存 PDF
         tmp_pdf_path = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf").name
         with open(tmp_pdf_path, "wb") as f:
+            uploaded_pdf.seek(0)
             f.write(uploaded_pdf.read())
 
         page_to_barcode = {}
@@ -80,14 +120,14 @@ if uploaded_excel and uploaded_pdf:
             for i, page in enumerate(reader.pages):
                 barcode = extract_barcode(page, pdf_type)
                 page_to_barcode[i] = barcode
-                st.write(f"Page {i+1}: Detected Barcode = {barcode}")
+                st.write(f"Page {i+1}: Detected Barcode = {repr(barcode)}")
         else:  # FBA
             with pdfplumber.open(tmp_pdf_path) as pdf:
                 for i, page in enumerate(pdf.pages):
                     barcode = extract_barcode(page, pdf_type)
                     page_to_barcode[i] = barcode
-                    st.write(f"Page {i+1}: Detected Barcode = {barcode}")
-            reader = PdfReader(tmp_pdf_path)  # FBA 生成 PDF
+                    st.write(f"Page {i+1}: Detected Barcode = {repr(barcode)}")
+            reader = PdfReader(tmp_pdf_path)
 
         # 排序 PDF
         writer = PdfWriter()
